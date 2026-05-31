@@ -21,7 +21,7 @@ def run_ablation_study():
     sweet_spot_intervals = [5, 10, 25]
     
     # We only need to compare the baseline, the worst, and your best method
-    target_methods = ['arithmetic_mean', 'standard_kl', 'weighted_visits_kl']
+    target_methods = ['arithmetic_mean', 'standard_kl', 'weighted_visits_kl', 'trust_decay_kl']
     
     # 2. Define the Sensor Noise Profiles
     # alpha = false positive rate (ghosts), beta = false negative rate (misses)

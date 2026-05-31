@@ -93,7 +93,7 @@ class ReasonableResourceManager:
                 'target_patterns': ['stationary', 'random', 'evasive', 'patrol'],
                 'fast_mode': False,
                 'random_walk_mode': False,
-                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean']
+                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'trust_decay_kl']
             },
             'large': {
                 'grid_sizes': [[10, 10], [15, 15], [20, 20], [25, 25], [30, 30], [40, 40], [45, 45], [50, 50], [100, 100]],
@@ -105,7 +105,7 @@ class ReasonableResourceManager:
                 'target_patterns': ['stationary', 'random', 'evasive', 'patrol'],
                 'fast_mode': False,
                 'random_walk_mode': False,
-                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'weighted_visits_kl']
+                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'weighted_visits_kl', 'trust_decay_kl']
             }
         }
         

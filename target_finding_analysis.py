@@ -30,7 +30,8 @@ LABEL_MAPPING = {
     'reverse_kl': 'Reverse KL (Numerical Approximator)',
     'arithmetic_mean': 'Arithmetic Mean (Exact Analytical)',
     'geometric_mean': 'Geometric Mean (Exact Analytical)',
-    'weighted_visits_kl': 'Visit-Weighted KL (Proposed)'
+    'weighted_visits_kl': 'Visit-Weighted KL (Proposed)',
+    'trust_decay_kl': 'Trust-Decay KL (Proposed)'
 }
 
 COLORS = {
@@ -38,7 +39,8 @@ COLORS = {
     'Reverse KL (Numerical Approximator)': '#e74c3c', # Red
     'Arithmetic Mean (Exact Analytical)': '#95a5a6',  # Grey
     'Geometric Mean (Exact Analytical)': '#2ecc71',   # Green
-    'Visit-Weighted KL (Proposed)': '#9b59b6'         # Purple
+    'Visit-Weighted KL (Proposed)': '#9b59b6',        # Purple
+    'Trust-Decay KL (Proposed)': '#e67e22'            # Orange
 }
 
 CACHE_FILE = "results/data_cache.pkl"
@@ -298,7 +300,8 @@ def analyze_target_finding(checkpoints_dir="checkpoints"):
         'Arithmetic Mean (Exact Analytical)',
         'Reverse KL (Numerical Approximator)',
         'Geometric Mean (Exact Analytical)',
-        'Visit-Weighted KL (Proposed)'
+        'Visit-Weighted KL (Proposed)',
+        'Trust-Decay KL (New method Proposed)'
     ]
     
     # 1. Success Rate by Method

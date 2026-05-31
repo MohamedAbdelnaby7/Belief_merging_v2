@@ -43,6 +43,7 @@ import socket
 import subprocess
 import math
 import gc
+import functools
 
 # Gurobi Import
 try:
@@ -52,6 +53,76 @@ except ImportError:
     print("WARNING: gurobipy not found. Optimization methods will fall back to analytical solutions.")
 
 warnings.filterwarnings('ignore')
+
+
+# ===================================================================
+# TRUST DECAY: Expected mutual information per step from sensor model
+# ===================================================================
+
+@functools.lru_cache(maxsize=256)
+def compute_I_step(alpha: float, beta: float, n_points: int = 200) -> float:
+    """
+    Expected mutual information (bits) per step between two agents' binary
+    observations of the same target, averaged over all possible prior
+    probabilities in [0, 1].
+
+    This quantity depends only on the sensor model parameters alpha and beta,
+    not on any realized observations or agent paths.  It is therefore
+    computable without any additional inter-agent communication.
+
+    Physics:
+        Two agents independently observe a binary target (present / absent)
+        through the same noisy channel:
+            P(z=1 | target present) = 1 - beta
+            P(z=1 | target absent)  = alpha
+        Given the target state T, observations z_i and z_j are conditionally
+        independent.  The mutual information I(z_i ; z_j) arises entirely
+        from the shared latent variable T.
+
+    Args:
+        alpha:    False positive rate.
+        beta:     False negative rate.
+        n_points: Number of prior values to average over (more = more accurate).
+
+    Returns:
+        Average expected mutual information in bits per step.
+
+    Notes:
+        - Perfect sensors (alpha=0, beta=0) yield the maximum I_step (1 bit at
+          p=0.5), producing the steepest temporal decay.
+        - Random sensors (alpha=beta=0.5) yield I_step=0; no decay applied.
+        - Result is cached via lru_cache so it is computed at most once per
+          unique (alpha, beta) pair during a run.
+    """
+    EPS = 1e-12
+
+    def h2(p: float) -> float:
+        p = max(EPS, min(1.0 - EPS, p))
+        return -p * math.log2(p) - (1.0 - p) * math.log2(1.0 - p)
+
+    def h_joint(p11: float, p10: float, p01: float, p00: float) -> float:
+        total = 0.0
+        for v in (p11, p10, p01, p00):
+            v = max(v, EPS)
+            total -= v * math.log2(v)
+        return total
+
+    mis = []
+    for k in range(1, n_points):
+        p = k / n_points  # prior P(target at this cell) in (0, 1)
+
+        # Joint distribution of (z_i, z_j) via conditional independence on T
+        p11 = p * (1.0 - beta) ** 2 + (1.0 - p) * alpha ** 2
+        p10 = p * (1.0 - beta) * beta + (1.0 - p) * alpha * (1.0 - alpha)
+        p01 = p10  # symmetric sensor
+        p00 = p * beta ** 2 + (1.0 - p) * (1.0 - alpha) ** 2
+
+        p_z1 = p * (1.0 - beta) + (1.0 - p) * alpha  # P(z_i = 1) = P(z_j = 1)
+
+        mi = h2(p_z1) + h2(p_z1) - h_joint(p11, p10, p01, p00)
+        mis.append(max(0.0, mi))  # clamp floating-point negatives
+
+    return float(np.mean(mis)) if mis else 0.0
 
 
 # ===================================================================
@@ -269,6 +340,60 @@ class UnifiedBeliefMergingFramework:
         
         # 3. Normalize to ensure valid probability distribution
         return merged / np.sum(merged)
+
+    def merge_beliefs_trust_decay(self, beliefs, visit_counts,
+                                  blackout_steps, alpha, beta,
+                                  lambda_decay=1.0):
+        """
+        Temporally-discounted visit-weighted belief merge.
+
+        Combines the spatial reliability signal of merge_beliefs_visit_weighted
+        with a temporal decay that accounts for how much information was missed
+        during the communication blackout.
+
+        The merged belief is interpolated between:
+            - The visit-weighted merge   (full trust, gamma = 1)
+            - The uniform distribution   (no trust,  gamma = 0)
+
+        where gamma = exp(-lambda_decay * blackout_steps * I_step(alpha, beta)).
+
+        I_step is computed entirely from the sensor model parameters; no
+        observation history or agent path is shared.  See compute_I_step for
+        derivation.
+
+        Args:
+            beliefs:        List of per-agent belief arrays (length n_agents).
+            visit_counts:   List of per-agent visit-count arrays (length n_agents).
+            blackout_steps: Number of steps agents operated independently since
+                            the last merge (equals merge_interval in the current
+                            fixed-schedule simulation).
+            alpha:          Sensor false positive rate.
+            beta:           Sensor false negative rate.
+            lambda_decay:   Tunable decay rate; higher values produce steeper
+                            trust loss per unit of I_step * blackout_steps.
+
+        Returns:
+            Normalised merged belief array.
+        """
+        if len(beliefs) == 1:
+            return beliefs[0].copy()
+
+        # Spatial component: visit-weighted arithmetic mean (existing method)
+        visit_merged = self.merge_beliefs_visit_weighted(beliefs, visit_counts)
+
+        # Temporal component: decay factor from sensor model and blackout length
+        i_step = compute_I_step(alpha, beta)
+        gamma = float(np.exp(-lambda_decay * blackout_steps * i_step))
+
+        # Interpolate between trusted merge and maximum-uncertainty uniform prior
+        n_states = len(visit_merged)
+        uniform = np.ones(n_states) / n_states
+        blended = gamma * visit_merged + (1.0 - gamma) * uniform
+
+        total = float(np.sum(blended))
+        if total < 1e-15:
+            return uniform
+        return blended / total
     
     def jensen_shannon_divergence(self, p, q):
         """Calculate Jensen-Shannon divergence between two distributions"""
@@ -610,6 +735,13 @@ class ControlledMergingExperiment:
                     merged_belief = self.merger.merge_beliefs_kl(agent_beliefs)
                 elif merge_method == 'weighted_visits_kl':
                     merged_belief = self.merger.merge_beliefs_visit_weighted(agent_beliefs, agent_visit_counts)
+                elif merge_method == 'trust_decay_kl':
+                    merged_belief = self.merger.merge_beliefs_trust_decay(
+                        agent_beliefs, agent_visit_counts,
+                        blackout_steps=merge_interval,
+                        alpha=self.alpha,
+                        beta=self.beta
+                    )
                 else: # Fallback to KL
                     merged_belief = self.merger.merge_beliefs_kl(agent_beliefs)
                 
@@ -831,7 +963,7 @@ class ExperimentConfig:
         if self.target_patterns is None:
             self.target_patterns = ['stationary', 'random', 'evasive', 'patrol']
         if self.merge_methods is None:
-            self.merge_methods = ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'weighted_visits_kl']
+            self.merge_methods = ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'weighted_visits_kl', 'trust_decay_kl']
     
     def to_dict(self):
         d = asdict(self)
