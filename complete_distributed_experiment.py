@@ -63,21 +63,16 @@ warnings.filterwarnings('ignore')
 def compute_I_step(alpha: float, beta: float, n_points: int = 200) -> float:
     """
     Expected mutual information (bits) per step between two agents' binary
-    observations of the same target, averaged over all possible prior
-    probabilities in [0, 1].
+    observations of the same target, averaged uniformly over all prior
+    probabilities in (0, 1).
 
-    This quantity depends only on the sensor model parameters alpha and beta,
-    not on any realized observations or agent paths.  It is therefore
-    computable without any additional inter-agent communication.
+    Depends only on sensor parameters alpha and beta.  No observation
+    sharing required.  Result is cached per unique (alpha, beta) pair.
 
-    Physics:
-        Two agents independently observe a binary target (present / absent)
-        through the same noisy channel:
-            P(z=1 | target present) = 1 - beta
-            P(z=1 | target absent)  = alpha
-        Given the target state T, observations z_i and z_j are conditionally
-        independent.  The mutual information I(z_i ; z_j) arises entirely
-        from the shared latent variable T.
+    Note on N > 2 agents: this function computes the pairwise quantity
+    between exactly two agents.  The calling code scales by (N - 1) to
+    account for the number of other agents each agent was disconnected from.
+    See merge_beliefs_trust_decay for the scaling.
 
     Args:
         alpha:    False positive rate.
@@ -109,18 +104,17 @@ def compute_I_step(alpha: float, beta: float, n_points: int = 200) -> float:
 
     mis = []
     for k in range(1, n_points):
-        p = k / n_points  # prior P(target at this cell) in (0, 1)
+        p = k / n_points
 
-        # Joint distribution of (z_i, z_j) via conditional independence on T
         p11 = p * (1.0 - beta) ** 2 + (1.0 - p) * alpha ** 2
-        p10 = p * (1.0 - beta) * beta + (1.0 - p) * alpha * (1.0 - alpha)
-        p01 = p10  # symmetric sensor
-        p00 = p * beta ** 2 + (1.0 - p) * (1.0 - alpha) ** 2
+        p10 = p * (1.0 - beta) * beta  + (1.0 - p) * alpha * (1.0 - alpha)
+        p01 = p10                        # symmetric sensor model
+        p00 = p * beta ** 2             + (1.0 - p) * (1.0 - alpha) ** 2
 
-        p_z1 = p * (1.0 - beta) + (1.0 - p) * alpha  # P(z_i = 1) = P(z_j = 1)
+        p_z1 = p * (1.0 - beta) + (1.0 - p) * alpha
 
         mi = h2(p_z1) + h2(p_z1) - h_joint(p11, p10, p01, p00)
-        mis.append(max(0.0, mi))  # clamp floating-point negatives
+        mis.append(max(0.0, mi))
 
     return float(np.mean(mis)) if mis else 0.0
 
@@ -343,34 +337,39 @@ class UnifiedBeliefMergingFramework:
 
     def merge_beliefs_trust_decay(self, beliefs, visit_counts,
                                   blackout_steps, alpha, beta,
-                                  lambda_decay=1.0):
+                                  b_prior, n_agents, lambda_decay=1.0):
         """
         Temporally-discounted visit-weighted belief merge.
 
-        Combines the spatial reliability signal of merge_beliefs_visit_weighted
-        with a temporal decay that accounts for how much information was missed
-        during the communication blackout.
+        Combines the spatial visit-weighted merge (full trust) with the
+        collective belief at the moment of last disconnection (b_prior)
+        via a convex combination.  The prior is the correct floor because
+        agents are never maximally ignorant at a merge event — everything
+        known before the blackout remains valid; only the new observations
+        made during the blackout are in doubt.
 
-        The merged belief is interpolated between:
-            - The visit-weighted merge   (full trust, gamma = 1)
-            - The uniform distribution   (no trust,  gamma = 0)
+        The decay factor accounts for the number of agents:
+            gamma = exp(-lambda_decay * blackout_steps * (n_agents - 1) * I_step)
 
-        where gamma = exp(-lambda_decay * blackout_steps * I_step(alpha, beta)).
-
-        I_step is computed entirely from the sensor model parameters; no
-        observation history or agent path is shared.  See compute_I_step for
-        derivation.
+        The (n_agents - 1) factor reflects that each agent was disconnected
+        from (n_agents - 1) other information sources.  I_step is the
+        pairwise mutual information between two agents' observations, so
+        multiplying by (n_agents - 1) approximates the total missed
+        information.  This is an upper bound (it overcounts slightly due to
+        shared information through the common target state) but is in the
+        correct direction: more agents disconnected -> steeper decay.
 
         Args:
-            beliefs:        List of per-agent belief arrays (length n_agents).
-            visit_counts:   List of per-agent visit-count arrays (length n_agents).
-            blackout_steps: Number of steps agents operated independently since
-                            the last merge (equals merge_interval in the current
-                            fixed-schedule simulation).
+            beliefs:        List of per-agent belief arrays.
+            visit_counts:   List of per-agent visit-count arrays.
+            blackout_steps: Steps since last merge (merge_interval in the
+                            current fixed-schedule simulation).
             alpha:          Sensor false positive rate.
             beta:           Sensor false negative rate.
-            lambda_decay:   Tunable decay rate; higher values produce steeper
-                            trust loss per unit of I_step * blackout_steps.
+            b_prior:        Merged belief at the moment of last disconnection.
+                            Initialized to uniform on the first merge.
+            n_agents:       Number of agents in the team.
+            lambda_decay:   Tunable decay rate.
 
         Returns:
             Normalised merged belief array.
@@ -378,21 +377,19 @@ class UnifiedBeliefMergingFramework:
         if len(beliefs) == 1:
             return beliefs[0].copy()
 
-        # Spatial component: visit-weighted arithmetic mean (existing method)
+        # Spatial component: visit-weighted arithmetic mean (unchanged)
         visit_merged = self.merge_beliefs_visit_weighted(beliefs, visit_counts)
 
-        # Temporal component: decay factor from sensor model and blackout length
+        # Temporal component: pairwise I_step scaled by number of disconnected peers
         i_step = compute_I_step(alpha, beta)
-        gamma = float(np.exp(-lambda_decay * blackout_steps * i_step))
+        gamma = float(np.exp(-lambda_decay * blackout_steps * (n_agents - 1) * i_step))
 
-        # Interpolate between trusted merge and maximum-uncertainty uniform prior
-        n_states = len(visit_merged)
-        uniform = np.ones(n_states) / n_states
-        blended = gamma * visit_merged + (1.0 - gamma) * uniform
+        # Linear combination between trusted merge and last known collective belief
+        blended = gamma * visit_merged + (1.0 - gamma) * b_prior
 
         total = float(np.sum(blended))
         if total < 1e-15:
-            return uniform
+            return b_prior.copy()
         return blended / total
     
     def jensen_shannon_divergence(self, p, q):
@@ -687,6 +684,12 @@ class ControlledMergingExperiment:
         # Track how many times each agent visits each cell
         n_states = self.grid_size[0] * self.grid_size[1]
         agent_visit_counts = [np.zeros(n_states) for _ in range(self.n_agents)]
+
+        # Trust decay: prior belief at the last merge event.
+        # Initialized to uniform (no collective knowledge yet).
+        # Updated to the merged belief after every merge event, regardless
+        # of which merge method is active.
+        b_prior_at_last_merge = np.ones(n_states) / n_states
         
         # Mark initial positions as visited
         for i, pos in enumerate(agent_positions):
@@ -740,7 +743,9 @@ class ControlledMergingExperiment:
                         agent_beliefs, agent_visit_counts,
                         blackout_steps=merge_interval,
                         alpha=self.alpha,
-                        beta=self.beta
+                        beta=self.beta,
+                        b_prior=b_prior_at_last_merge,
+                        n_agents=self.n_agents
                     )
                 else: # Fallback to KL
                     merged_belief = self.merger.merge_beliefs_kl(agent_beliefs)
@@ -748,7 +753,20 @@ class ControlledMergingExperiment:
                 # Update all agents with merged belief
                 for i in range(self.n_agents):
                     agent_beliefs[i] = merged_belief.copy()
-                
+
+                # Update prior for the next merge event (all methods share this)
+                b_prior_at_last_merge = merged_belief.copy()
+
+                # Reset visit counts for the new blackout period.
+                # The previous counts are already incorporated into the merged
+                # belief. Carrying them forward would double-count those
+                # observations in future merges. Each blackout starts fresh
+                # so the visit weights only reflect what agents independently
+                # observed since the last communication.
+                for i in range(self.n_agents):
+                    agent_visit_counts[i] = np.zeros(n_states)
+                    agent_visit_counts[i][agent_positions[i]] += 1
+
                 # Calculate entropy change
                 entropy_before = np.mean([entropy(b) for b in beliefs_before])
                 entropy_after = entropy(merged_belief)
