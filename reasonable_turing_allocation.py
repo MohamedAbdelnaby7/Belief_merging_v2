@@ -68,8 +68,10 @@ class ReasonableResourceManager:
                 'target_patterns': ['random'],
                 'fast_mode': False,
                 'random_walk_mode': False,
-                #'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean']
-                'merge_methods': ['standard_kl', 'reverse_kl']
+                'prior_type': 'gaussian',
+                'prior_sigma_fraction': 0.15,
+                'comm_model': 'poisson',
+                'merge_methods': ['arithmetic_mean', 'weighted_visits_kl', 'trust_decay_kl_adaptive']
             },
             'small': {
                 'grid_sizes': [[10, 10], [20, 20]],
@@ -77,11 +79,18 @@ class ReasonableResourceManager:
                 'n_trials': 20,
                 'horizon': 2,
                 'max_steps': 500,
-                'merge_intervals': [0, 25, 100, float('inf')],
+                'merge_intervals': [5, 25, 100],
                 'target_patterns': ['random', 'evasive'],
                 'fast_mode': False,
                 'random_walk_mode': False,
-                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean']
+                'prior_type': 'gaussian',
+                'prior_sigma_fraction': 0.15,
+                'comm_model': 'poisson',
+                'merge_methods': [
+                    'arithmetic_mean', 'geometric_mean',
+                    'weighted_visits_kl', 'weighted_visits_kl_reset',
+                    'trust_decay_kl', 'trust_decay_kl_adaptive'
+                ]
             },
             'standard': {
                 'grid_sizes': [[10, 10], [20, 20], [30, 30]],
@@ -89,23 +98,38 @@ class ReasonableResourceManager:
                 'n_trials': 50,
                 'horizon': 3,
                 'max_steps': 1000,
-                'merge_intervals': [0, 10, 25, 50, 100, 200, float('inf')],
+                'merge_intervals': [5, 10, 25, 50, 100],
                 'target_patterns': ['stationary', 'random', 'evasive', 'patrol'],
                 'fast_mode': False,
                 'random_walk_mode': False,
-                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'trust_decay_kl']
+                'prior_type': 'gaussian',
+                'prior_sigma_fraction': 0.15,
+                'comm_model': 'poisson',
+                'merge_methods': [
+                    'arithmetic_mean', 'geometric_mean',
+                    'weighted_visits_kl', 'weighted_visits_kl_reset',
+                    'trust_decay_kl', 'trust_decay_kl_adaptive'
+                ]
             },
             'large': {
-                'grid_sizes': [[10, 10], [15, 15], [20, 20], [25, 25], [30, 30], [40, 40], [45, 45], [50, 50], [100, 100]],
+                'grid_sizes': [[10, 10], [15, 15], [20, 20], [25, 25], [30, 30],
+                               [40, 40], [45, 45], [50, 50], [100, 100]],
                 'n_agents_list': [2, 3],
                 'n_trials': 10,
                 'horizon': 3,
                 'max_steps': 2500,
-                'merge_intervals': [0, 5, 10, 25, 50, 100, 200, 500, float('inf')],
+                'merge_intervals': [5, 10, 25, 50, 100, 200],
                 'target_patterns': ['stationary', 'random', 'evasive', 'patrol'],
                 'fast_mode': False,
                 'random_walk_mode': False,
-                'merge_methods': ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'weighted_visits_kl', 'trust_decay_kl']
+                'prior_type': 'gaussian',
+                'prior_sigma_fraction': 0.15,
+                'comm_model': 'poisson',
+                'merge_methods': [
+                    'arithmetic_mean', 'geometric_mean',
+                    'weighted_visits_kl', 'weighted_visits_kl_reset',
+                    'trust_decay_kl', 'trust_decay_kl_adaptive'
+                ]
             }
         }
         
@@ -113,8 +137,12 @@ class ReasonableResourceManager:
         
         # Add common parameters
         full_config = {
-            'alpha': 0.1,  # False positive rate
-            'beta': 0.2,   # False negative rate
+            'alpha': 0.1,
+            'beta':  0.2,
+            # prior_type and prior_sigma_fraction are already set per template above.
+            # prior_sigma is kept as an absolute fallback; it is ignored when
+            # prior_sigma_fraction > 0 (which it is in all templates).
+            'prior_sigma': 5.0,
             **base_config
         }
         

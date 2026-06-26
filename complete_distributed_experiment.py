@@ -56,7 +56,7 @@ warnings.filterwarnings('ignore')
 
 
 # ===================================================================
-# TRUST DECAY: Expected mutual information per step from sensor model
+# TRUST DECAY — sensor-model mutual information and Gaussian prior
 # ===================================================================
 
 @functools.lru_cache(maxsize=256)
@@ -95,7 +95,7 @@ def compute_I_step(alpha: float, beta: float, n_points: int = 200) -> float:
         p = max(EPS, min(1.0 - EPS, p))
         return -p * math.log2(p) - (1.0 - p) * math.log2(1.0 - p)
 
-    def h_joint(p11: float, p10: float, p01: float, p00: float) -> float:
+    def h_joint(p11, p10, p01, p00) -> float:
         total = 0.0
         for v in (p11, p10, p01, p00):
             v = max(v, EPS)
@@ -117,6 +117,36 @@ def compute_I_step(alpha: float, beta: float, n_points: int = 200) -> float:
         mis.append(max(0.0, mi))
 
     return float(np.mean(mis)) if mis else 0.0
+
+
+def compute_gaussian_prior(grid_size: tuple, center_cell: int,
+                           sigma: float) -> np.ndarray:
+    """
+    Initialise a belief as a 2D isotropic Gaussian centred on center_cell.
+
+    Models the scenario where the target's last known location is
+    approximately known (rescue mission, last GPS fix).  Setting sigma to
+    a large value (e.g. grid_size[0]) recovers the uniform distribution.
+
+    Args:
+        grid_size:   (rows, cols) tuple.
+        center_cell: flat cell index of the distribution centre.
+        sigma:       standard deviation in grid cells.
+
+    Returns:
+        Normalised belief array of shape (rows * cols,).
+    """
+    rows, cols = grid_size
+    cy, cx = divmod(center_cell, cols)
+    n_states = rows * cols
+    belief = np.zeros(n_states)
+    two_sigma_sq = 2.0 * max(sigma, 1e-6) ** 2
+    for s in range(n_states):
+        sy, sx = divmod(s, cols)
+        dist_sq = float((sy - cy) ** 2 + (sx - cx) ** 2)
+        belief[s] = math.exp(-dist_sq / two_sigma_sq)
+    total = float(np.sum(belief))
+    return belief / total if total > 1e-15 else np.ones(n_states) / n_states
 
 
 # ===================================================================
@@ -318,7 +348,7 @@ class UnifiedBeliefMergingFramework:
     
     def merge_beliefs_visit_weighted(self, beliefs, visit_counts):
         """Analytical solution for state-weighted KL divergence"""
-        if len(beliefs) == 1: 
+        if len(beliefs) == 1:
             return beliefs[0].copy()
         
         # 1. Calculate state-specific weights (using your +1 smoothing logic)
@@ -337,39 +367,41 @@ class UnifiedBeliefMergingFramework:
 
     def merge_beliefs_trust_decay(self, beliefs, visit_counts,
                                   blackout_steps, alpha, beta,
-                                  b_prior, n_agents, lambda_decay=1.0):
+                                  b_prior, n_agents,
+                                  current_entropy=None, h_max=None,
+                                  lambda_decay=1.0):
         """
         Temporally-discounted visit-weighted belief merge.
 
-        Combines the spatial visit-weighted merge (full trust) with the
-        collective belief at the moment of last disconnection (b_prior)
-        via a convex combination.  The prior is the correct floor because
-        agents are never maximally ignorant at a merge event — everything
-        known before the blackout remains valid; only the new observations
-        made during the blackout are in doubt.
+        The decay factor is:
 
-        The decay factor accounts for the number of agents:
-            gamma = exp(-lambda_decay * blackout_steps * (n_agents - 1) * I_step)
+            gamma = exp(-lambda * k * log2(N) * I_step(alpha,beta) * w_entropy)
 
-        The (n_agents - 1) factor reflects that each agent was disconnected
-        from (n_agents - 1) other information sources.  I_step is the
-        pairwise mutual information between two agents' observations, so
-        multiplying by (n_agents - 1) approximates the total missed
-        information.  This is an upper bound (it overcounts slightly due to
-        shared information through the common target state) but is in the
-        correct direction: more agents disconnected -> steeper decay.
+        where w_entropy = 1 - H_ratio  (entropy weight).
+
+        When current_entropy is None (or h_max is None), w_entropy = 1 and
+        the method degrades to fixed-gamma trust decay (trust_decay_kl
+        behaviour).  When entropy information is supplied, the method
+        activates as trust_decay_kl_adaptive: decay is near-zero during
+        exploration (high entropy) and strongest during exploitation (peaked
+        belief), aligned with the Bizyaeva bifurcation framework.
+
+        Floor: b_prior — the consensus merged belief from the previous
+        communication event.  NOT the uniform distribution.  Reverting to
+        b_prior preserves accumulated spatial knowledge; reverting to uniform
+        destroys it.
 
         Args:
-            beliefs:        List of per-agent belief arrays.
-            visit_counts:   List of per-agent visit-count arrays.
-            blackout_steps: Steps since last merge (merge_interval in the
-                            current fixed-schedule simulation).
-            alpha:          Sensor false positive rate.
-            beta:           Sensor false negative rate.
-            b_prior:        Merged belief at the moment of last disconnection.
-                            Initialized to uniform on the first merge.
-            n_agents:       Number of agents in the team.
-            lambda_decay:   Tunable decay rate.
+            beliefs:          List of per-agent belief arrays.
+            visit_counts:     List of per-agent visit-count arrays.
+            blackout_steps:   Steps since last merge.
+            alpha:            Sensor false positive rate.
+            beta:             Sensor false negative rate.
+            b_prior:          Consensus belief at last disconnection.
+            n_agents:         Number of agents in the team.
+            current_entropy:  Entropy of current merged belief (optional).
+            h_max:            log2(|S|), maximum possible entropy (optional).
+            lambda_decay:     Tunable decay rate.
 
         Returns:
             Normalised merged belief array.
@@ -380,14 +412,19 @@ class UnifiedBeliefMergingFramework:
         # Spatial component: visit-weighted arithmetic mean (unchanged)
         visit_merged = self.merge_beliefs_visit_weighted(beliefs, visit_counts)
 
-        # Temporal component: pairwise I_step scaled by number of disconnected peers
-        i_step = compute_I_step(alpha, beta)
-        gamma = float(np.exp(-lambda_decay * blackout_steps * (n_agents - 1) * i_step))
+        i_step      = compute_I_step(alpha, beta)
+        n_scale     = math.log2(max(float(n_agents), 2.0))
 
-        # Linear combination between trusted merge and last known collective belief
+        if current_entropy is not None and h_max is not None and h_max > 1e-15:
+            h_ratio       = float(current_entropy) / float(h_max)
+            entropy_weight = max(0.0, 1.0 - h_ratio)
+        else:
+            entropy_weight = 1.0
+
+        gamma   = float(np.exp(-lambda_decay * blackout_steps * n_scale
+                               * i_step * entropy_weight))
         blended = gamma * visit_merged + (1.0 - gamma) * b_prior
-
-        total = float(np.sum(blended))
+        total   = float(np.sum(blended))
         if total < 1e-15:
             return b_prior.copy()
         return blended / total
@@ -645,17 +682,27 @@ class ControlledMergingExperiment:
     Main experiment class with proper MPC implementation
     """
     
-    def __init__(self, grid_size=(20, 20), n_agents=4, alpha=0.1, beta=0.2, horizon=2):
+    def __init__(self, grid_size=(20, 20), n_agents=4, alpha=0.1, beta=0.2, horizon=2,
+                 prior_type='uniform', prior_sigma=5.0, prior_sigma_fraction=0.0):
         self.grid_size = grid_size
         self.n_agents = n_agents
-        self.alpha = alpha  # False positive rate
-        self.beta = beta   # False negative rate
-        self.merger = UnifiedBeliefMergingFramework(grid_size, n_agents)
-        # REPLACED MCTS WITH MPC
-        self.planner = MultiAgentMPC(grid_size, n_agents, horizon, alpha, beta) 
+        self.alpha = alpha
+        self.beta  = beta
+        # Compute effective sigma: fraction overrides absolute when > 0.
+        # This ensures consistent prior concentration across all grid sizes.
+        if prior_sigma_fraction > 0.0:
+            self.prior_sigma = prior_sigma_fraction * min(grid_size[0], grid_size[1])
+        else:
+            self.prior_sigma = prior_sigma
+        self.prior_type  = prior_type   # 'uniform' or 'gaussian'
+        self.prior_sigma = prior_sigma  # std dev in grid cells for Gaussian prior
+        self.merger  = UnifiedBeliefMergingFramework(grid_size, n_agents)
+        self.planner = MultiAgentMPC(grid_size, n_agents, horizon, alpha, beta)
         
-    def _run_single_experiment(self, trial_config, merge_interval, max_steps, fast_mode=False, 
-                               random_walk_mode=False, merge_method='standard_kl'):
+    def _run_single_experiment(self, trial_config, merge_interval, max_steps,
+                               fast_mode=False, random_walk_mode=False,
+                               merge_method='standard_kl',
+                               comm_model='fixed', trial_seed=0):
         """Run a single experiment with specified merge interval and method"""
         # Special case for full communication
         if merge_interval == 0:
@@ -664,11 +711,21 @@ class ControlledMergingExperiment:
         # For other strategies
         start_time = time.time()
         
-        # Initialize agents with independent beliefs
-        agent_beliefs = [
-            np.ones(self.grid_size[0] * self.grid_size[1]) / (self.grid_size[0] * self.grid_size[1])
-            for _ in range(self.n_agents)
-        ]
+        # Initialize agent beliefs from configured prior distribution
+        n_states = self.grid_size[0] * self.grid_size[1]
+        H_MAX = math.log2(n_states)
+
+        initial_target = trial_config['target_trajectory'][0]
+        if self.prior_type == 'gaussian':
+            agent_beliefs = [
+                compute_gaussian_prior(self.grid_size, initial_target, self.prior_sigma)
+                for _ in range(self.n_agents)
+            ]
+        else:
+            agent_beliefs = [
+                np.ones(n_states) / n_states
+                for _ in range(self.n_agents)
+            ]
         
         agent_positions = trial_config['initial_positions'].copy()
         agent_trajectories = [[pos] for pos in agent_positions]
@@ -685,11 +742,32 @@ class ControlledMergingExperiment:
         n_states = self.grid_size[0] * self.grid_size[1]
         agent_visit_counts = [np.zeros(n_states) for _ in range(self.n_agents)]
 
-        # Trust decay: prior belief at the last merge event.
-        # Initialized to uniform (no collective knowledge yet).
-        # Updated to the merged belief after every merge event, regardless
-        # of which merge method is active.
-        b_prior_at_last_merge = np.ones(n_states) / n_states
+        # ── Communication schedule ────────────────────────────────────────────
+        # For 'fixed':   merge every merge_interval steps (original behaviour)
+        # For 'poisson': pre-generate event times drawn from an exponential
+        #                distribution with mean = merge_interval.
+        #                Using a separate RNG seeded from trial_seed ensures
+        #                reproducibility while keeping comm events independent
+        #                of observation randoms.
+        if comm_model == 'poisson' and merge_interval not in (0, float('inf')):
+            _comm_rng = np.random.RandomState((trial_seed * 1_000_003 + 7) % (2 ** 31 - 1))
+            _intervals = _comm_rng.exponential(scale=float(merge_interval),
+                                               size=max_steps)
+            _times     = np.cumsum(_intervals)
+            poisson_events = set(int(t) for t in _times if 0 < t < max_steps)
+        else:
+            poisson_events = None
+
+        # Tracks the last step at which communication occurred.
+        # Used to compute the actual blackout duration passed to trust decay.
+        last_comm_step = 0
+        # Initialised to the same prior as agent beliefs so the floor is
+        # always consistent with the starting belief.
+        b_prior_at_last_merge = agent_beliefs[0].copy()
+
+        # Belief map quality tracking
+        # Q_t = mean probability assigned to true target location across agents
+        belief_quality_history = []
         
         # Mark initial positions as visited
         for i, pos in enumerate(agent_positions):
@@ -722,12 +800,22 @@ class ControlledMergingExperiment:
                 'max': np.max(divergences) if divergences else 0
             })
             
-            # Check if it's time to merge
-            if merge_interval != float('inf') and step > 0 and step % merge_interval == 0:
-                # Save beliefs BEFORE merge
-                beliefs_before = [b.copy() for b in agent_beliefs]
-                
-                # Perform belief merging - UPDATED TO SUPPORT METHODS
+            # ── Communication event check ─────────────────────────────────────
+            # Fixed model  : fire every merge_interval steps exactly.
+            # Poisson model: fire when step is in the pre-generated event set.
+            if comm_model == 'poisson' and poisson_events is not None:
+                should_communicate = (step in poisson_events)
+            elif merge_interval != float('inf') and merge_interval != 0:
+                should_communicate = (step > 0 and step % merge_interval == 0)
+            else:
+                should_communicate = False
+
+            if should_communicate:
+                # Actual blackout duration — varies per event under Poisson model
+                actual_blackout = max(1, step - last_comm_step)
+                beliefs_before  = [b.copy() for b in agent_beliefs]
+                current_entropy = float(np.mean([entropy(b) for b in agent_beliefs]))
+
                 if merge_method == 'geometric_mean':
                     merged_belief = self.merger.merge_beliefs_geometric(agent_beliefs)
                 elif merge_method == 'arithmetic_mean':
@@ -737,45 +825,57 @@ class ControlledMergingExperiment:
                 elif merge_method == 'standard_kl':
                     merged_belief = self.merger.merge_beliefs_kl(agent_beliefs)
                 elif merge_method == 'weighted_visits_kl':
-                    merged_belief = self.merger.merge_beliefs_visit_weighted(agent_beliefs, agent_visit_counts)
+                    # Cumulative visit counts — original CDC paper behaviour
+                    merged_belief = self.merger.merge_beliefs_visit_weighted(
+                        agent_beliefs, agent_visit_counts)
+                elif merge_method == 'weighted_visits_kl_reset':
+                    # Same formula, but visit counts reset after merge (see below)
+                    merged_belief = self.merger.merge_beliefs_visit_weighted(
+                        agent_beliefs, agent_visit_counts)
                 elif merge_method == 'trust_decay_kl':
+                    # Fixed-gamma trust decay (entropy weight = 1 always)
                     merged_belief = self.merger.merge_beliefs_trust_decay(
                         agent_beliefs, agent_visit_counts,
-                        blackout_steps=merge_interval,
-                        alpha=self.alpha,
-                        beta=self.beta,
+                        blackout_steps=actual_blackout,
+                        alpha=self.alpha, beta=self.beta,
                         b_prior=b_prior_at_last_merge,
-                        n_agents=self.n_agents
-                    )
-                else: # Fallback to KL
+                        n_agents=self.n_agents)
+                elif merge_method == 'trust_decay_kl_adaptive':
+                    # Entropy-weighted gamma: decay activates during exploitation
+                    merged_belief = self.merger.merge_beliefs_trust_decay(
+                        agent_beliefs, agent_visit_counts,
+                        blackout_steps=actual_blackout,
+                        alpha=self.alpha, beta=self.beta,
+                        b_prior=b_prior_at_last_merge,
+                        n_agents=self.n_agents,
+                        current_entropy=current_entropy,
+                        h_max=H_MAX)
+                else:
                     merged_belief = self.merger.merge_beliefs_kl(agent_beliefs)
-                
-                # Update all agents with merged belief
+
                 for i in range(self.n_agents):
                     agent_beliefs[i] = merged_belief.copy()
 
-                # Update prior for the next merge event (all methods share this)
+                # Update prior and last communication step
                 b_prior_at_last_merge = merged_belief.copy()
+                last_comm_step        = step
 
-                # Reset visit counts for the new blackout period.
-                # The previous counts are already incorporated into the merged
-                # belief. Carrying them forward would double-count those
-                # observations in future merges. Each blackout starts fresh
-                # so the visit weights only reflect what agents independently
-                # observed since the last communication.
-                for i in range(self.n_agents):
-                    agent_visit_counts[i] = np.zeros(n_states)
-                    agent_visit_counts[i][agent_positions[i]] += 1
+                # Reset visit counts for methods that use per-blackout counting
+                if merge_method in ('weighted_visits_kl_reset',
+                                    'trust_decay_kl',
+                                    'trust_decay_kl_adaptive'):
+                    for i in range(self.n_agents):
+                        agent_visit_counts[i] = np.zeros(n_states)
+                        agent_visit_counts[i][agent_positions[i]] += 1
 
-                # Calculate entropy change
-                entropy_before = np.mean([entropy(b) for b in beliefs_before])
                 entropy_after = entropy(merged_belief)
-                
                 merge_events.append({
-                    'step': step,
-                    'entropy_before': entropy_before,
-                    'entropy_after': entropy_after,
-                    'entropy_reduction': entropy_before - entropy_after
+                    'step':            step,
+                    'blackout_steps':  actual_blackout,
+                    'entropy_before':  float(np.mean([entropy(b) for b in beliefs_before])),
+                    'entropy_after':   float(entropy_after),
+                    'entropy_reduction': float(np.mean([entropy(b) for b in beliefs_before])) - float(entropy_after),
+                    'h_ratio':         float(entropy_after / H_MAX),
                 })
             
             # Get joint action using MPC
@@ -786,6 +886,13 @@ class ControlledMergingExperiment:
                 random_walk_mode=random_walk_mode
             )
             
+            # Belief map quality: mean probability mass at true target location
+            # This continuous metric reflects epistemic progress regardless of
+            # whether the binary discovery threshold has been crossed.
+            belief_quality_history.append(
+                float(np.mean([b[target_pos] for b in agent_beliefs]))
+            )
+
             # Make observations BEFORE moving
             for i, pos in enumerate(agent_positions):
                 obs_rand = trial_config['observation_randoms'][step, i]
@@ -840,13 +947,16 @@ class ControlledMergingExperiment:
         elapsed_time = time.time() - start_time
         
         return {
-            'target_found': target_found,
-            'first_discovery_step': first_discovery_step,
-            'discovery_count': discovery_count,
-            'elapsed_time': elapsed_time,
-            'final_merged_belief': final_merged,
-            'final_entropy': entropy(final_merged),
-            'entropy_history': entropy_history,
+            'target_found':           target_found,
+            'first_discovery_step':   first_discovery_step,
+            'discovery_count':        discovery_count,
+            'elapsed_time':           elapsed_time,
+            'belief_quality_history': belief_quality_history,
+            'avg_belief_quality':     float(np.mean(belief_quality_history)) if belief_quality_history else 0.0,
+            'final_belief_quality':   belief_quality_history[-1] if belief_quality_history else 0.0,
+            'final_merged_belief':    final_merged,
+            'final_entropy':          entropy(final_merged),
+            'entropy_history':        entropy_history,
             'divergence_history': divergence_history,
             'merge_events': merge_events,
             'total_merges': len(merge_events),
@@ -964,24 +1074,46 @@ class ExperimentConfig:
     """Configuration for the experiment - now supports multiple grid sizes and agent numbers"""
     grid_sizes: List[Tuple[int, int]] = field(default_factory=lambda: [(20, 20)])
     n_agents_list: List[int] = field(default_factory=lambda: [4])
-    alpha: float = 0.1  # False positive rate
-    beta: float = 0.2   # False negative rate
-    horizon: int = 2    # MPC horizon
+    alpha: float = 0.1
+    beta:  float = 0.2
+    horizon: int = 2
     n_trials: int = 30
     max_steps: int = 1000
     merge_intervals: List[Union[int, float]] = None
     target_patterns: List[str] = None
-    fast_mode: bool = False  # TRUE MPC by default
-    random_walk_mode: bool = False # Control mode: True = Random Walk, False = Active MPC
-    merge_methods: List[str] = None # List of methods to test
-    
+    fast_mode: bool = False
+    random_walk_mode: bool = False
+    merge_methods: List[str] = None
+    prior_type: str = 'gaussian'   # 'uniform' or 'gaussian'
+    # Absolute sigma in grid cells.  Use this when the prior uncertainty has
+    # a fixed physical interpretation (e.g. GPS accuracy in metres).
+    prior_sigma: float = 5.0
+    # Relative sigma as a fraction of min(rows, cols).  When > 0 this
+    # OVERRIDES prior_sigma so that concentration is consistent across all
+    # grid sizes.  Example: 0.15 gives sigma = 1.5 cells on a 10x10 grid
+    # and 7.5 cells on a 50x50 grid.  Use this for simulation comparisons
+    # that sweep grid sizes so the prior is equally informative at every scale.
+    prior_sigma_fraction: float = 0.15
+    # Communication model.
+    # 'fixed'   : merge every merge_interval steps exactly (original behaviour).
+    # 'poisson' : communication events fire at Poisson-process times with
+    #             mean inter-event duration = merge_interval.  All agents
+    #             participate in each event.  The actual blackout length
+    #             therefore varies per event, making trust decay genuinely
+    #             discriminative within a trial.
+    comm_model: str = 'poisson' # 'fixed' or 'poisson'
+
     def __post_init__(self):
         if self.merge_intervals is None:
             self.merge_intervals = [0, 10, 25, 50, 100, 200, 500, float('inf')]
         if self.target_patterns is None:
             self.target_patterns = ['stationary', 'random', 'evasive', 'patrol']
         if self.merge_methods is None:
-            self.merge_methods = ['standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean', 'weighted_visits_kl', 'trust_decay_kl']
+            self.merge_methods = [
+                'standard_kl', 'reverse_kl', 'geometric_mean', 'arithmetic_mean',
+                'weighted_visits_kl', 'weighted_visits_kl_reset',
+                'trust_decay_kl', 'trust_decay_kl_adaptive'
+            ]
     
     def to_dict(self):
         d = asdict(self)
@@ -999,7 +1131,7 @@ class ExperimentConfig:
 
 @dataclass
 class TrialTask:
-    """Individual trial task for parallel execution - now includes grid size and n_agents"""
+    """Individual trial task for parallel execution"""
     grid_size: Tuple[int, int]
     n_agents: int
     pattern: str
@@ -1009,14 +1141,20 @@ class TrialTask:
     config: ExperimentConfig
     trial_seed: int
     checkpoint_dir: str
-    
+
     def get_task_id(self):
-        """Generate unique task ID including grid size and n_agents"""
+        """Generate unique task ID including grid size, n_agents, and comm model."""
         grid_str = f"{self.grid_size[0]}x{self.grid_size[1]}"
-        return f"grid{grid_str}_agents{self.n_agents}_{self.pattern}_{self.merge_method}_trial{self.trial_id}_interval{self.merge_interval}_seed{self.trial_seed}"
-    
+        return (
+            f"grid{grid_str}_agents{self.n_agents}_{self.pattern}"
+            f"_{self.merge_method}_trial{self.trial_id}"
+            f"_interval{self.merge_interval}"
+            f"_{self.config.comm_model}"
+            f"_seed{self.trial_seed}"
+        )
+
     def get_checkpoint_path(self):
-        """Get checkpoint file path for this task"""
+        """Get checkpoint file path for this task."""
         return os.path.join(self.checkpoint_dir, f"{self.get_task_id()}.pkl")
 
 
@@ -1311,7 +1449,10 @@ def run_single_trial_task(task: TrialTask) -> Optional[Dict]:
             n_agents=task.n_agents,
             alpha=task.config.alpha,
             beta=task.config.beta,
-            horizon=task.config.horizon
+            horizon=task.config.horizon,
+            prior_type=task.config.prior_type,
+            prior_sigma=task.config.prior_sigma,
+            prior_sigma_fraction=task.config.prior_sigma_fraction
         )
         
         # Generate trial configuration
@@ -1363,23 +1504,26 @@ def run_single_trial_task(task: TrialTask) -> Optional[Dict]:
             trial_config,
             task.merge_interval,
             task.config.max_steps,
-            task.config.fast_mode,  # FALSE by default for TRUE MPC
-            task.config.random_walk_mode, # Control Mode
-            task.merge_method
+            task.config.fast_mode,
+            task.config.random_walk_mode,
+            task.merge_method,
+            comm_model=task.config.comm_model,
+            trial_seed=task.trial_seed
         )
         
         # Add metadata
         result['task_metadata'] = {
-            'grid_size': task.grid_size,
-            'n_agents': task.n_agents,
-            'pattern': task.pattern,
-            'trial_id': task.trial_id,
+            'grid_size':      task.grid_size,
+            'n_agents':       task.n_agents,
+            'pattern':        task.pattern,
+            'trial_id':       task.trial_id,
             'merge_interval': task.merge_interval,
-            'merge_method': task.merge_method,
-            'trial_seed': task.trial_seed,
-            'hostname': socket.gethostname(),
-            'pid': os.getpid(),
-            'completion_time': datetime.now().isoformat()
+            'merge_method':   task.merge_method,
+            'comm_model':     task.config.comm_model,
+            'trial_seed':     task.trial_seed,
+            'hostname':       socket.gethostname(),
+            'pid':            os.getpid(),
+            'completion_time':datetime.now().isoformat()
         }
         
         # Atomic save to checkpoint
